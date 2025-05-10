@@ -1,0 +1,10 @@
+python-dateutil
+pandas
+numpy
+matplotlib
+pytest
+websocket-client
+requests
+jupyter
+talib
+pytz

@@ -1,0 +1,104 @@
+# Environment variables and credentials
+.env
+*.env
+credentials.json
+config.ini
+secret_config.py
+
+# API keys and secrets
+*api_key*
+*secret*
+*token*
+*credentials*
+
+# Data directories
+data/
+historical/
+results/
+logs/
+backtests/
+
+# Python bytecode and cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+trading_env/
+.venv/
+.python-version
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*.ipynb
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.spyderproject
+.spyproject
+.ropeproject
+.pycharm_helpers/
+.DS_Store
+.project
+.pydevproject
+.settings/
+
+# Trading system specific
+*.csv
+*.xlsx
+*.xls
+*.pickle
+*.pkl
+*.hdf5
+*.h5
+*.sqlite
+*.db
+logs/
+output/
+tmp/
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Exceptions: Include these files even though they match patterns above
+!requirements.txt
+!example_data/*.csv
+!tests/fixtures/*.csv
+!data/README.md
