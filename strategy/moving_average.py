@@ -335,16 +335,7 @@ class MovingAverageStrategy(BaseStrategy):
         # You could fetch this from an API or a database.
         nifty50 = [
             "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
-            "HDFC", "ITC", "KOTAKBANK", "LT", "HINDUNILVR", 
-            "SBIN", "BAJFINANCE", "AXISBANK", "BHARTIARTL", "ASIANPAINT", 
-            "MARUTI", "HCLTECH", "TITAN", "SUNPHARMA", "NESTLEIND", 
-            "ULTRACEMCO", "TATAMOTORS", "WIPRO", "ADANIENT", "POWERGRID", 
-            "JSWSTEEL", "BAJAJFINSV", "NTPC", "TATASTEEL", "M&M", 
-            "TECHM", "BAJAJ-AUTO", "ADANIPORTS", "HINDALCO", "GRASIM", 
-            "HDFCLIFE", "COALINDIA", "DIVISLAB", "ONGC", "DRREDDY", 
-            "SBILIFE", "EICHERMOT", "INDUSINDBK", "TATACONSUM", "BRITANNIA", 
-            "CIPLA", "UPL", "HEROMOTOCO", "APOLLOHOSP", "BPCL"
-        ]
+            "HDFC", "ITC", "KOTAKBANK", "LT", "HINDUNILVR"]
         return nifty50
     
     def initialize_universe(self) -> None:

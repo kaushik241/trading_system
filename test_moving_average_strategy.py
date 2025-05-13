@@ -200,7 +200,10 @@ def test_strategy():
     print("-" * 40)
     
     # Fetch historical data for a limited set of symbols (for testing)
-    test_symbols = list(token_map.keys())[:3]  # first 3 symbols that we have tokens for
+    # test_symbols = list(token_map.keys())[:3]  # first 3 symbols that we have tokens for
+    test_symbols = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
+            "HDFC", "ITC", "KOTAKBANK", "LT", "HINDUNILVR",]
     if not test_symbols:
         logger.warning("No valid symbols with tokens found. Cannot proceed with testing.")
         return False
