@@ -1,4 +1,39 @@
-#!/usr/bin/env python
+def round_to_tick_size(self, price, is_buy=True):
+        """
+        Round price to the nearest valid tick size.
+        For buy orders, round down to avoid rejection for price too high.
+        For sell orders, round up to avoid rejection for price too low.
+        
+        Args:
+            price: The price to round
+            is_buy: Whether this is a buy order (True) or sell order (False)
+            
+        Returns:
+            Price rounded to the nearest valid tick size
+        """
+        if not hasattr(self, 'tick_size') or not self.tick_size:
+            return price  # Return unmodified if tick size not available
+        
+        # Calculate how many ticks
+        ticks = price / self.tick_size
+        
+        if is_buy:
+            # For buy orders, round down to nearest tick
+            rounded_ticks = math.floor(ticks)
+        else:
+            # For sell orders, round up to nearest tick
+            rounded_ticks = math.ceil(ticks)
+        
+        # Calculate rounded price
+        rounded_price = rounded_ticks * self.tick_size
+        
+        # Ensure we have the right precision (same number of decimal places as tick size)
+        tick_decimals = str(self.tick_size)[::-1].find('.')
+        if tick_decimals > 0:
+            rounded_price = round(rounded_price, tick_decimals)
+        
+        logger.debug(f"Rounded price from {price} to {rounded_price} (tick size: {self.tick_size})")
+        return rounded_price#!/usr/bin/env python
 """
 Simple Limit Order Execution Script
 
@@ -16,9 +51,10 @@ import time
 import logging
 import argparse
 import threading
+import math
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-load_dotenv(override=True)
+
 # Import trading system components
 from auth.zerodha_auth import ZerodhaAuth
 from data.realtime_data import RealTimeDataManager
@@ -116,17 +152,29 @@ class SimpleLimitOrderExecutor:
                 os.getenv("KITE_ACCESS_TOKEN")
             )
             
-            # Get instrument token for the symbol
-            token_map = self.historical_data_manager.get_instrument_tokens([self.symbol])
-            if not token_map or self.symbol not in token_map:
-                logger.error(f"Could not get instrument token for {self.symbol}")
+            # Get all instruments to fetch tick size information
+            logger.info("Fetching instrument details including tick size...")
+            instruments = self.kite.instruments("NSE")
+            
+            # Find our symbol and get its token and tick size
+            symbol_data = None
+            for instrument in instruments:
+                if instrument['tradingsymbol'] == self.symbol:
+                    symbol_data = instrument
+                    break
+            
+            if not symbol_data:
+                logger.error(f"Could not find instrument data for {self.symbol}")
                 return False
             
-            self.token = token_map[self.symbol]
-            self.symbol_token_map = token_map
-            self.token_symbol_map = {v: k for k, v in token_map.items()}
+            self.token = symbol_data['instrument_token']
+            self.tick_size = symbol_data.get('tick_size', 0.05)  # Default to 0.05 if not found
             
-            logger.info(f"Initialized with token {self.token} for {self.symbol}")
+            logger.info(f"Found {self.symbol} with token {self.token} and tick size {self.tick_size}")
+            
+            # Create token mappings
+            self.symbol_token_map = {self.symbol: self.token}
+            self.token_symbol_map = {self.token: self.symbol}
             
             # Setup WebSocket callbacks
             self.realtime_data.register_callback('on_tick', self.on_tick)
@@ -216,19 +264,27 @@ class SimpleLimitOrderExecutor:
                 # If depth is not available, use last price
                 if self.last_price:
                     # Place slightly above last price for a buy order
-                    new_price = round(self.last_price * 1.0005, 2)  # 0.05% above last price
+                    raw_price = round(self.last_price * 1.0005, 2)  # 0.05% above last price
+                    new_price = self.round_to_tick_size(raw_price, is_buy=True)
                     logger.info(f"No market depth available. Using last price +0.05%: {new_price}")
                     self.update_order_price(new_price)
                 return
             
             # For a buy order, we want to place it at or slightly above the ask price
             # This increases the chance of execution
-            new_price = round(ask_price * 1.0002, 2)  # 0.02% above ask price
+            raw_price = round(ask_price * 1.0002, 2)  # 0.02% above ask price
+            new_price = self.round_to_tick_size(raw_price, is_buy=True)
             
-            # Only update if the price difference is significant
-            if self.limit_price is None or abs(new_price - self.limit_price) > 0.05:
+            # Only update if the price is different from current limit price
+            if self.limit_price is None or new_price != self.limit_price:
                 logger.info(f"Updating order price: {self.limit_price} -> {new_price}")
                 self.update_order_price(new_price)
+                
+                # If new price is lower than current price, update more aggressively
+                if self.limit_price and new_price < self.limit_price:
+                    self.order_update_interval = 0.5  # Update more frequently when price is dropping
+                else:
+                    self.order_update_interval = 1.0  # Normal update interval
     
     def update_order_price(self, new_price):
         """Update the limit order price."""
@@ -240,6 +296,7 @@ class SimpleLimitOrderExecutor:
             self.limit_price = new_price
             
             # Modify the order
+            logger.info(f"Modifying order {self.order_id} with parameters: {{'price': {new_price}}}")
             modified_order_id = self.order_manager.modify_order(
                 order_id=self.order_id,
                 price=new_price
@@ -249,6 +306,22 @@ class SimpleLimitOrderExecutor:
             
         except Exception as e:
             logger.error(f"Error updating order price: {e}")
+            # If we get a tick size error, log additional info to help debug
+            if "tick size" in str(e).lower():
+                logger.error(f"Tick size error detected. Current tick size: {getattr(self, 'tick_size', 'Unknown')}")
+                logger.error(f"Attempted price: {new_price}, Raw float: {float(new_price)}")
+                # Try again with a more strictly rounded price
+                try:
+                    strict_price = float(int(new_price / self.tick_size) * self.tick_size)
+                    logger.info(f"Retrying with strictly rounded price: {strict_price}")
+                    self.limit_price = strict_price
+                    modified_order_id = self.order_manager.modify_order(
+                        order_id=self.order_id,
+                        price=strict_price
+                    )
+                    logger.info(f"Order price updated with strict rounding: {strict_price}, Order ID: {modified_order_id}")
+                except Exception as retry_error:
+                    logger.error(f"Retry also failed: {retry_error}")
     
     def on_order_update(self, ws, order_data):
         """Handle order updates from WebSocket."""
@@ -287,7 +360,12 @@ class SimpleLimitOrderExecutor:
             
             # Use last price if no limit price specified
             if self.limit_price is None:
-                self.limit_price = self.last_price
+                # Calculate initial limit price (slightly above current price to increase chance of fill)
+                raw_price = self.last_price * 1.0005  # 0.05% above current price
+                self.limit_price = self.round_to_tick_size(raw_price, is_buy=True)
+            else:
+                # If limit price was specified, make sure it's properly rounded
+                self.limit_price = self.round_to_tick_size(self.limit_price, is_buy=True)
             
             logger.info(f"Placing limit buy order for {self.symbol}: {self.quantity} @ {self.limit_price}")
             
@@ -348,6 +426,27 @@ class SimpleLimitOrderExecutor:
             
         except Exception as e:
             logger.error(f"Error exiting position: {e}")
+            # If there's an error, try again with a limit order
+            try:
+                logger.info("Retrying exit with a limit order")
+                if self.last_price:
+                    # Use a limit price slightly below the current market price for quick execution
+                    raw_price = self.last_price * 0.9995  # 0.05% below current price
+                    limit_price = self.round_to_tick_size(raw_price, is_buy=False)  # for sell order
+                    
+                    self.exit_order_id = self.order_manager.place_order(
+                        symbol=self.symbol,
+                        exchange="NSE",
+                        transaction_type="SELL",
+                        quantity=self.quantity,
+                        product="MIS",
+                        order_type="LIMIT",
+                        price=limit_price
+                    )
+                    logger.info(f"Sell limit order placed with ID: {self.exit_order_id} at price {limit_price}")
+            except Exception as retry_e:
+                logger.error(f"Error placing limit sell order: {retry_e}")
+                logger.error("CRITICAL: Unable to exit position automatically. Manual intervention required!")
     
     def run(self):
         """Run the simple limit order execution process."""
@@ -379,7 +478,7 @@ class SimpleLimitOrderExecutor:
                 if (datetime.now() - self.last_tick_time).total_seconds() > 30:
                     logger.warning("No tick data received in 30 seconds")
                 
-                time.sleep(30)
+                time.sleep(0.5)
             
             logger.info("Trade complete!")
             return True
