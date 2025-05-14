@@ -10,18 +10,18 @@ You can modify these values directly or override them with command line argument
 SYMBOLS = "RELIANCE,HDFCBANK"  # Comma-separated list of symbols
 
 # Strategy parameters
-SHORT_EMA_PERIOD = 9  # Period for the shorter EMA
-LONG_EMA_PERIOD = 21  # Period for the longer EMA 
+SHORT_EMA_PERIOD = 2  # Period for the shorter EMA
+LONG_EMA_PERIOD = 10  # Period for the longer EMA 
 TIMEFRAME = 5  # Candle timeframe in minutes
 
 # Risk management parameters
 MAX_POSITION_SIZE = 1  # Maximum position size per symbol
-STOP_LOSS_PERCENT = 0.01  # 1% stop loss
+STOP_LOSS_PERCENT = 0.02  # 1% stop loss
 
 # Time parameters
 MARKET_OPEN_TIME = "09:15:00"  # Market open time
 MARKET_CLOSE_TIME = "15:30:00"  # Market close time
-SQUARE_OFF_TIME = "15:14:00"  # Time to square off all positions
+SQUARE_OFF_TIME = "15:10:00"  # Time to square off all positions
 
 # Order parameters
 USE_LIMIT_ORDERS = True  # Use limit orders at best bid/ask prices

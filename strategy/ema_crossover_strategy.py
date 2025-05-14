@@ -401,6 +401,60 @@ class EMAIntraDayStrategy(BaseStrategy):
         if symbol in self.stopped_symbols:
             return None
             
+        # Check if there are pending orders - avoid generating conflicting signals
+        if self.has_pending_orders(symbol):
+            order_id = self.active_orders[symbol].get('order_id')
+            logger.debug(f"{datetime.now()} - {symbol}: Pending order {order_id}, skipping signal generation")
+            
+            # Still check if we need to update order price
+            current_time = datetime.now()
+            last_update = self.order_update_times.get(symbol, datetime.min)
+            
+            # Update limit orders every second if they're still pending
+            if (current_time - last_update).total_seconds() > 1:
+                self.order_update_times[symbol] = current_time
+                
+                # Get current bid/ask
+                bid_price = tick.get('depth', {}).get('buy', [{}])[0].get('price')
+                ask_price = tick.get('depth', {}).get('sell', [{}])[0].get('price')
+                
+                if not bid_price or not ask_price:
+                    logger.warning(f"{datetime.now()} - {symbol}: Missing depth information in tick")
+                    return None
+                    
+                # Update price based on order side
+                side = self.active_orders[symbol].get('side')
+                order_id = self.active_orders[symbol].get('order_id')
+                
+                if side == 'BUY':
+                    new_price = ask_price  # Use ask price for buy
+                    logger.info(f"{datetime.now()} - {symbol}: Updating BUY order price to {new_price}")
+                    
+                    return {
+                        "symbol": symbol,
+                        "exchange": self.exchange,
+                        "action": "UPDATE",
+                        "order_id": order_id,
+                        "order_type": "LIMIT",
+                        "price": new_price,
+                        "signal_type": "order_update"
+                    }
+                elif side == 'SELL':
+                    new_price = bid_price  # Use bid price for sell
+                    logger.info(f"{datetime.now()} - {symbol}: Updating SELL order price to {new_price}")
+                    
+                    return {
+                        "symbol": symbol,
+                        "exchange": self.exchange,
+                        "action": "UPDATE",
+                        "order_id": order_id,
+                        "order_type": "LIMIT",
+                        "price": new_price,
+                        "signal_type": "order_update"
+                    }
+            
+            return None
+            
         # Get historical data
         data = self.get_historical_data(symbol)
         if data is None or len(data) < self.long_ema_period:
@@ -486,52 +540,6 @@ class EMAIntraDayStrategy(BaseStrategy):
             # Generate signals
             return self.generate_signals(symbol, data)
         
-        # Check for pending orders that need price updates
-        active_order = self.active_orders.get(symbol)
-        last_update = self.order_update_times.get(symbol, datetime.min)
-        
-        # Update limit orders every second if they're still pending
-        if active_order and active_order.get('status') == 'OPEN' and \
-           (datetime.now() - last_update).total_seconds() > 1:
-            
-            self.order_update_times[symbol] = datetime.now()
-            
-            # Get current bid/ask
-            bid_price = tick.get('depth', {}).get('buy', [{}])[0].get('price')
-            ask_price = tick.get('depth', {}).get('sell', [{}])[0].get('price')
-            
-            if not bid_price or not ask_price:
-                logger.warning(f"{datetime.now()} - {symbol}: Missing depth information in tick")
-                return None
-                
-            # Update price based on order side
-            if active_order.get('side') == 'BUY':
-                new_price = ask_price  # Use ask price for buy
-                logger.info(f"{datetime.now()} - {symbol}: Updating BUY order price to {new_price}")
-                
-                return {
-                    "symbol": symbol,
-                    "exchange": self.exchange,
-                    "action": "UPDATE",
-                    "order_id": active_order.get('order_id'),
-                    "order_type": "LIMIT",
-                    "price": new_price,
-                    "signal_type": "order_update"
-                }
-            elif active_order.get('side') == 'SELL':
-                new_price = bid_price  # Use bid price for sell
-                logger.info(f"{datetime.now()} - {symbol}: Updating SELL order price to {new_price}")
-                
-                return {
-                    "symbol": symbol,
-                    "exchange": self.exchange,
-                    "action": "UPDATE",
-                    "order_id": active_order.get('order_id'),
-                    "order_type": "LIMIT",
-                    "price": new_price,
-                    "signal_type": "order_update"
-                }
-        
         return None
     
     def on_order_update(self, symbol: str, order_update: Dict[str, Any]) -> None:
@@ -592,13 +600,30 @@ class EMAIntraDayStrategy(BaseStrategy):
         self.active_orders[symbol] = {
             'order_id': order_id,
             'status': 'OPEN',
-            'side': side
+            'side': side,
+            'timestamp': datetime.now()
         }
         
         # Initialize order update time
         self.order_update_times[symbol] = datetime.now()
     
-    def get_market_price_for_order(self, symbol: str, tick: Dict[str, Any], is_buy: bool) -> float:
+    def has_pending_orders(self, symbol: str) -> bool:
+        """
+        Check if a symbol has pending orders.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            True if the symbol has pending orders, False otherwise
+        """
+        if symbol not in self.active_orders:
+            return False
+            
+        order_status = self.active_orders[symbol].get('status')
+        return order_status in ['OPEN', 'PENDING', 'TRIGGER PENDING']
+    
+    def get_market_price_for_order(self, symbol: str, tick: Dict[str, Any], is_buy: bool) -> Optional[float]:
         """
         Get the appropriate market price for a limit order.
         
@@ -608,31 +633,40 @@ class EMAIntraDayStrategy(BaseStrategy):
             is_buy: True for buy orders, False for sell orders
             
         Returns:
-            Price to use for the limit order
+            Price to use for the limit order, or None if price not available
         """
-        depth = tick.get('depth', {})
-        
-        if is_buy:
-            # For buy orders, use the ask price (best selling price)
-            asks = depth.get('sell', [])
-            if asks and 'price' in asks[0]:
-                price = asks[0]['price']
-                logger.info(f"{datetime.now()} - {symbol}: Using ask price for BUY: {price}")
+        try:
+            depth = tick.get('depth', {})
+            
+            if is_buy:
+                # For buy orders, use the ask price (best selling price)
+                asks = depth.get('sell', [])
+                if asks and 'price' in asks[0]:
+                    price = asks[0]['price']
+                    logger.info(f"{datetime.now()} - {symbol}: Using ask price for BUY: {price}")
+                    return price
+            else:
+                # For sell orders, use the bid price (best buying price)
+                bids = depth.get('buy', [])
+                if bids and 'price' in bids[0]:
+                    price = bids[0]['price']
+                    logger.info(f"{datetime.now()} - {symbol}: Using bid price for SELL: {price}")
+                    return price
+            
+            # If depth is not available, use last price
+            price = tick.get('last_price')
+            if price:
+                logger.warning(f"{datetime.now()} - {symbol}: Depth not available, using last price: {price}")
                 return price
-        else:
-            # For sell orders, use the bid price (best buying price)
-            bids = depth.get('buy', [])
-            if bids and 'price' in bids[0]:
-                price = bids[0]['price']
-                logger.info(f"{datetime.now()} - {symbol}: Using bid price for SELL: {price}")
-                return price
-        
-        # If depth is not available, use last price
-        price = tick.get('last_price')
-        logger.warning(f"{datetime.now()} - {symbol}: Depth not available, using last price: {price}")
-        return price
+            else:
+                logger.error(f"{datetime.now()} - {symbol}: No valid price found in tick data")
+                return None
+                
+        except Exception as e:
+            logger.error(f"{datetime.now()} - {symbol}: Error getting market price: {e}")
+            return tick.get('last_price')  # Fallback to last price
     
-    def prepare_order_parameters(self, signal: Dict[str, Any], tick: Dict[str, Any] = None) -> Dict[str, Any]:
+    def prepare_order_parameters(self, signal: Dict[str, Any], tick: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
         """
         Prepare order parameters from a signal.
         
@@ -641,35 +675,58 @@ class EMAIntraDayStrategy(BaseStrategy):
             tick: Current market tick data (optional)
             
         Returns:
-            Dictionary with order parameters
+            Dictionary with order parameters or None if parameters cannot be prepared
         """
-        symbol = signal.get('symbol')
-        action = signal.get('action')
-        
-        # Basic order parameters
-        order_params = {
-            "symbol": symbol,
-            "exchange": signal.get("exchange", self.exchange),
-            "transaction_type": action,
-            "quantity": signal.get("quantity", self.max_position_size),
-            "product": "MIS",  # Always MIS for intraday
-            "order_type": signal.get("order_type", "LIMIT"),
-            "tag": f"{self.name}_{signal.get('signal_type', 'signal')}"
-        }
-        
-        # If this is an update to an existing order
-        if action == 'UPDATE':
-            order_params['order_id'] = signal.get('order_id')
+        try:
+            symbol = signal.get('symbol')
+            action = signal.get('action')
             
-        # Set price based on tick data for LIMIT orders
-        if order_params['order_type'] == 'LIMIT' and tick and 'price' not in signal:
-            is_buy = action == 'BUY'
-            order_params['price'] = self.get_market_price_for_order(symbol, tick, is_buy)
-        elif 'price' in signal:
-            order_params['price'] = signal['price']
+            if not symbol or not action:
+                logger.error(f"{datetime.now()} - Missing required fields in signal: {signal}")
+                return None
             
-        # Remove None values
-        order_params = {k: v for k, v in order_params.items() if v is not None}
-        
-        logger.info(f"{datetime.now()} - {symbol}: Prepared order parameters: {order_params}")
-        return order_params
+            # Basic order parameters
+            order_params = {
+                "symbol": symbol,
+                "exchange": signal.get("exchange", self.exchange),
+                "transaction_type": action,
+                "quantity": signal.get("quantity", self.max_position_size),
+                "product": "MIS",  # Always MIS for intraday
+                "order_type": signal.get("order_type", "LIMIT"),
+                "tag": f"{self.name}_{signal.get('signal_type', 'signal')}"
+            }
+            
+            # If this is an update to an existing order
+            if action == 'UPDATE':
+                if 'order_id' not in signal:
+                    logger.error(f"{datetime.now()} - {symbol}: Missing order_id for UPDATE signal")
+                    return None
+                    
+                order_params['order_id'] = signal.get('order_id')
+                
+            # Set price based on tick data for LIMIT orders
+            if order_params['order_type'] == 'LIMIT':
+                if 'price' in signal and signal['price']:
+                    order_params['price'] = signal['price']
+                elif tick:
+                    is_buy = action == 'BUY'
+                    price = self.get_market_price_for_order(symbol, tick, is_buy)
+                    if price:
+                        order_params['price'] = price
+                    else:
+                        logger.error(f"{datetime.now()} - {symbol}: Unable to determine price for order")
+                        return None
+                else:
+                    logger.error(f"{datetime.now()} - {symbol}: No price in signal and no tick data for LIMIT order")
+                    return None
+                
+            # Remove None values
+            order_params = {k: v for k, v in order_params.items() if v is not None}
+            
+            logger.info(f"{datetime.now()} - {symbol}: Prepared order parameters: {order_params}")
+            return order_params
+            
+        except Exception as e:
+            logger.error(f"{datetime.now()} - Error preparing order parameters: {e}")
+            logger.error(f"{datetime.now()} - Signal: {signal}")
+            return None

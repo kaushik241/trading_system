@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 # Import our modules
 from auth.zerodha_auth import ZerodhaAuth
 from data.historical_data import HistoricalDataManager
-
+load_dotenv(override=True)
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,

@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from auth.zerodha_auth import ZerodhaAuth
 from data.realtime_data import RealTimeDataManager
 from data.historical_data import HistoricalDataManager
-
+load_dotenv(override=True)
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
