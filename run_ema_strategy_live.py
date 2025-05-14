@@ -13,12 +13,15 @@ import sys
 import time
 import logging
 import argparse
+import traceback
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
+from threading import Thread, Lock
 
 import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
-
+load_dotenv(override=True)
 # Import trading system components
 from auth.zerodha_auth import ZerodhaAuth
 from data.historical_data import HistoricalDataManager
@@ -26,7 +29,7 @@ from data.realtime_data import RealTimeDataManager
 from strategy.ema_crossover_strategy import EMAIntraDayStrategy
 from execution.order_manager import OrderManager
 from risk.risk_manager import RiskManager
-load_dotenv(override=True)
+
 # Import configuration (with fallback if not found)
 try:
     from config.ema_strategy_config import (
@@ -77,7 +80,22 @@ class EMAStrategyLiveTrader:
         self.is_running = False
         self.last_position_log_time = datetime.min
         self.last_order_check_time = datetime.min
+        self.last_tick_time = {}  # To track when we last received a tick for each symbol
+        self.last_price = {}  # To track the last price for each symbol
         self.debug_log_interval = 300  # 5 minutes in seconds
+        
+        # Candle formation
+        self.current_candle = {}  # To track the current candle for each symbol
+        self.candle_lock = Lock()  # Lock for thread-safe candle updates
+        self.candle_timer_thread = None
+        self.last_candle_time = {}  # To track when we last formed a candle
+        self.force_candle_closure = True  # Force candle closure even without bar_close flag
+        
+        # WebSocket state
+        self.connection_check_interval = 60  # Check WebSocket every 60 seconds
+        self.last_connection_check = datetime.min
+        self.ws_reconnect_attempts = 0
+        self.max_ws_reconnect_attempts = 5
         
         self.logger = logging.getLogger(__name__)
     
@@ -128,6 +146,7 @@ class EMAStrategyLiveTrader:
         
         # Initialize ZerodhaAuth
         try:
+            self.logger.info("Initializing Zerodha authentication...")
             self.auth = ZerodhaAuth(api_key, api_secret, access_token)
             
             # Validate connection
@@ -144,6 +163,7 @@ class EMAStrategyLiveTrader:
             
         except Exception as e:
             self.logger.error(f"Authentication failed: {e}")
+            self.logger.error(traceback.format_exc())
             return False
     
     def initialize_components(self):
@@ -153,6 +173,8 @@ class EMAStrategyLiveTrader:
             if not self.kite:
                 self.logger.error("Authentication not completed. Cannot initialize components.")
                 return False
+            
+            self.logger.info("Initializing trading components...")
             
             # Initialize data managers
             self.historical_data_manager = HistoricalDataManager(self.kite)
@@ -186,11 +208,19 @@ class EMAStrategyLiveTrader:
                 self.debug_log_interval = self.args.debug_interval
                 self.logger.info(f"Setting debug logging interval to {self.debug_log_interval} seconds")
             
+            # Initialize the candle tracking for each symbol
+            for symbol in self.symbols:
+                self.current_candle[symbol] = None
+                self.last_candle_time[symbol] = datetime.min
+                self.last_tick_time[symbol] = datetime.min
+                self.last_price[symbol] = None
+            
             self.logger.info("Components initialized successfully")
             return True
             
         except Exception as e:
             self.logger.error(f"Error initializing components: {e}")
+            self.logger.error(traceback.format_exc())
             return False
     
     def setup_universe(self):
@@ -233,11 +263,17 @@ class EMAStrategyLiveTrader:
                 self.strategy.update_indicators(symbol, indicators)
                 
                 self.logger.info(f"Initialized {symbol} with {len(data)} candles")
+                
+                # Initialize last price
+                if not data.empty:
+                    self.last_price[symbol] = data['close'].iloc[-1]
+                    self.logger.info(f"Initial price for {symbol}: {self.last_price[symbol]}")
             
             return True
             
         except Exception as e:
             self.logger.error(f"Error setting up universe: {e}")
+            self.logger.error(traceback.format_exc())
             return False
     
     def fetch_historical_data(self, days_back=7):
@@ -273,17 +309,41 @@ class EMAStrategyLiveTrader:
                 # Fetch data - Use the strategy's timeframe
                 interval = self.strategy.timeframe
                 
+                self.logger.info(f"Fetching historical data for {symbol} with token {token} using interval {interval}")
+                
                 df = self.historical_data_manager.fetch_historical_data(
                     token, from_date_str, to_date_str, interval
                 )
                 
                 if df is not None and not df.empty:
+                    # Check if data looks valid
+                    has_ohlc_variation = False
+                    for _, row in df.iterrows():
+                        if row['high'] != row['low'] or row['open'] != row['close']:
+                            has_ohlc_variation = True
+                            break
+                    
                     historical_data[symbol] = df
                     self.logger.info(f"Fetched {len(df)} {interval} candles for {symbol}")
+                    
+                    # Log the first 3 and last 3 candles for verification
+                    self.logger.info(f"First 3 candles for {symbol}:")
+                    for i in range(min(3, len(df))):
+                        candle = df.iloc[i]
+                        self.logger.info(f"  {df.index[i]}: O={candle['open']}, H={candle['high']}, L={candle['low']}, C={candle['close']}, Vol={candle.get('volume', 'N/A')}")
+                    
+                    self.logger.info(f"Last 3 candles for {symbol}:")
+                    for i in range(max(0, len(df)-3), len(df)):
+                        candle = df.iloc[i]
+                        self.logger.info(f"  {df.index[i]}: O={candle['open']}, H={candle['high']}, L={candle['low']}, C={candle['close']}, Vol={candle.get('volume', 'N/A')}")
+                    
+                    if not has_ohlc_variation:
+                        self.logger.warning(f"WARNING: Historical data for {symbol} shows no variation in OHLC values. This is suspicious and may indicate data quality issues.")
                 else:
                     self.logger.warning(f"No data fetched for {symbol}")
             except Exception as e:
                 self.logger.error(f"Error fetching data for {symbol}: {e}")
+                self.logger.error(traceback.format_exc())
         
         return historical_data
     
@@ -293,9 +353,13 @@ class EMAStrategyLiveTrader:
         self.realtime_data.register_callback('on_tick', self.on_tick)
         self.realtime_data.register_callback('on_order_update', self.on_order_update)
         self.realtime_data.register_callback('on_connect', self.on_connect)
+        self.realtime_data.register_callback('on_close', self.on_close)
+        self.realtime_data.register_callback('on_error', self.on_error)
+        self.realtime_data.register_callback('on_reconnect', self.on_reconnect)
+        self.realtime_data.register_callback('on_noreconnect', self.on_noreconnect)
         
         return True
-        
+    
     def on_connect(self, response):
         """
         Callback when WebSocket connection is established.
@@ -304,6 +368,7 @@ class EMAStrategyLiveTrader:
             response: Connection response
         """
         self.logger.info(f"WebSocket connected: {response}")
+        self.ws_reconnect_attempts = 0
         
         # Now that we're connected, subscribe to tokens
         tokens = list(self.token_map.values())
@@ -312,6 +377,154 @@ class EMAStrategyLiveTrader:
             self.realtime_data.subscribe(tokens, self.token_symbol_map, self.token_map)
         else:
             self.logger.error("No tokens to subscribe to")
+    
+    def on_close(self, code, reason):
+        """
+        Callback when WebSocket connection is closed.
+        
+        Args:
+            code: Close code
+            reason: Close reason
+        """
+        self.logger.warning(f"WebSocket connection closed: {code} - {reason}")
+        # Connection will be auto-reconnected by the RealTimeDataManager
+    
+    def on_error(self, code, reason):
+        """
+        Callback when WebSocket connection encounters an error.
+        
+        Args:
+            code: Error code
+            reason: Error reason
+        """
+        self.logger.error(f"WebSocket error: {code} - {reason}")
+        # Connection will be auto-reconnected by the RealTimeDataManager
+    
+    def on_reconnect(self, attempts_count):
+        """
+        Callback when WebSocket is attempting to reconnect.
+        
+        Args:
+            attempts_count: Number of reconnection attempts
+        """
+        self.logger.warning(f"WebSocket reconnecting... Attempt {attempts_count}")
+        self.ws_reconnect_attempts = attempts_count
+    
+    def on_noreconnect(self):
+        """Callback when WebSocket has exhausted reconnection attempts."""
+        self.logger.error("WebSocket reconnection failed after maximum attempts")
+        # Try to manually restart the connection
+        self.restart_websocket()
+    
+    def restart_websocket(self):
+        """Try to manually restart the WebSocket connection."""
+        try:
+            self.logger.info("Manually restarting WebSocket connection...")
+            
+            # Stop the current connection
+            if self.realtime_data:
+                self.realtime_data.stop()
+                time.sleep(2)  # Wait a bit before reconnecting
+            
+            # Create a new RealTimeDataManager instance
+            self.realtime_data = RealTimeDataManager(
+                os.getenv("KITE_API_KEY"), 
+                os.getenv("KITE_ACCESS_TOKEN")
+            )
+            
+            # Set up callbacks again
+            self.setup_callbacks()
+            
+            # Start the connection
+            if self.realtime_data.start():
+                self.logger.info("WebSocket connection restarted successfully")
+                return True
+            else:
+                self.logger.error("Failed to restart WebSocket connection")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error restarting WebSocket connection: {e}")
+            self.logger.error(traceback.format_exc())
+            return False
+    
+    def check_websocket_connection(self):
+        """Check WebSocket connection status and reconnect if needed."""
+        # Only check every connection_check_interval seconds
+        current_time = datetime.now()
+        if (current_time - self.last_connection_check).total_seconds() < self.connection_check_interval:
+            return True
+            
+        self.last_connection_check = current_time
+        
+        # Check if WebSocket is connected
+        if not self.realtime_data.is_connected:
+            self.logger.warning("WebSocket not connected, attempting to reconnect...")
+            return self.restart_websocket()
+        
+        # Check if we received ticks recently
+        stale_symbols = self.get_stale_tick_symbols()
+        if stale_symbols:
+            self.logger.warning(f"Tick data is stale for symbols: {stale_symbols}, restarting WebSocket connection...")
+            
+            # Before restarting, log mode and subscription status
+            self.logger.info("Debug WebSocket state before restart:")
+            self.logger.info(f"  is_connected: {self.realtime_data.is_connected}")
+            self.logger.info(f"  subscribed_tokens: {self.realtime_data.subscribed_tokens}")
+            
+            return self.restart_websocket()
+        
+        # Make sure we're getting price variations - log warning if all prices are identical
+        self.check_price_variations()
+        
+        return True
+    
+    def get_stale_tick_symbols(self):
+        """Get list of symbols with stale tick data."""
+        stale_symbols = []
+        current_time = datetime.now()
+        for symbol in self.symbols:
+            last_tick = self.last_tick_time.get(symbol, datetime.min)
+            # If we haven't received a tick in 5 minutes for any symbol, consider data stale
+            if (current_time - last_tick).total_seconds() > 300:  # 5 minutes
+                stale_symbols.append(symbol)
+        return stale_symbols
+    
+    def check_price_variations(self):
+        """Check if we're getting price variations for each symbol."""
+        current_time = datetime.now()
+        
+        # Only check once every 10 minutes
+        if not hasattr(self, 'last_variation_check') or (current_time - self.last_variation_check).total_seconds() > 600:
+            self.last_variation_check = current_time
+            
+            for symbol in self.symbols:
+                # Check current candle
+                if symbol in self.current_candle and self.current_candle[symbol]:
+                    candle = self.current_candle[symbol]
+                    
+                    # If high equals low and open equals close, that's suspicious
+                    if candle['high'] == candle['low'] and candle['open'] == candle['close']:
+                        minutes_old = (current_time - candle['timestamp']).total_seconds() / 60
+                        
+                        # Only warn if the candle has been around for a while (not just started)
+                        if minutes_old >= 2:  # At least 2 minutes old
+                            self.logger.warning(f"WARNING: Current candle for {symbol} has identical OHLC values after {minutes_old:.1f} minutes: {candle}")
+                            self.logger.warning(f"This suggests we may not be receiving price updates correctly for {symbol}")
+                            
+                            # Force a fake price update to see if it's captured
+                            last_price = self.last_price.get(symbol)
+                            if last_price:
+                                # Create a fake tick with a small price change
+                                fake_price = last_price * 1.0001  # 0.01% change
+                                self.logger.info(f"Attempting to verify price update system for {symbol} by injecting a test price: {last_price} -> {fake_price}")
+                                
+                                # Process the fake price update through the normal channels
+                                fake_tick = {
+                                    'last_price': fake_price,
+                                    'volume': candle.get('volume', 0),
+                                    'is_test_tick': True  # Mark as test
+                                }
+                                self.update_current_candle(symbol, fake_tick)
     
     def on_tick(self, symbol, tick):
         """
@@ -326,7 +539,39 @@ class EMAStrategyLiveTrader:
             # If we get a token instead of a symbol, convert it
             symbol = self.token_symbol_map.get(symbol, str(symbol))
         
+        # Update last tick time and price
+        self.last_tick_time[symbol] = datetime.now()
+        
+        # Extract last price from tick
+        last_price = tick.get('last_price')
+        if last_price:
+            # Check if price has changed
+            prev_price = self.last_price.get(symbol)
+            if prev_price is not None and prev_price != last_price:
+                self.logger.info(f"✅ Price change for {symbol}: {prev_price} -> {last_price}")
+            else:
+                self.logger.debug(f"Tick received for {symbol} with price: {last_price} (unchanged)")
+            
+            # Update last price
+            self.last_price[symbol] = last_price
+            
+        # Log entire tick data periodically (every 20th tick) for debugging
+        if hasattr(self, 'tick_count') and symbol in self.tick_count:
+            self.tick_count[symbol] += 1
+            if self.tick_count[symbol] % 20 == 0:  # Log every 20th tick
+                self.logger.info(f"Full tick data for {symbol}: {tick}")
+        else:
+            if not hasattr(self, 'tick_count'):
+                self.tick_count = {}
+            self.tick_count[symbol] = 1
+        
         try:
+            # Check if we need to update the current candle
+            self.update_current_candle(symbol, tick)
+            
+            # Check if we should form a new candle
+            self.check_candle_formation(symbol, tick)
+            
             # Process tick with strategy
             signal = self.strategy.process_tick(symbol, tick)
             
@@ -361,6 +606,182 @@ class EMAStrategyLiveTrader:
         
         except Exception as e:
             self.logger.error(f"Error processing tick for {symbol}: {e}")
+            self.logger.error(traceback.format_exc())
+    
+    def update_current_candle(self, symbol, tick):
+        """
+        Update the current candle with tick data.
+        
+        Args:
+            symbol: Trading symbol
+            tick: Tick data dictionary
+        """
+        current_time = datetime.now()
+        last_price = tick.get('last_price')
+        
+        if not last_price:
+            return
+        
+        with self.candle_lock:
+            # Initialize candle if needed
+            if symbol not in self.current_candle or self.current_candle[symbol] is None:
+                # Round down to nearest timeframe interval
+                candle_time = current_time.replace(
+                    minute=(current_time.minute // self.args.timeframe) * self.args.timeframe,
+                    second=0,
+                    microsecond=0
+                )
+                
+                self.current_candle[symbol] = {
+                    'timestamp': candle_time,
+                    'open': last_price,
+                    'high': last_price,
+                    'low': last_price,
+                    'close': last_price,
+                    'volume': tick.get('volume', 0)
+                }
+                self.logger.info(f"Initialized new candle for {symbol} at {candle_time}: O={last_price}, H={last_price}, L={last_price}, C={last_price}")
+                
+                # Also log the entire tick data when initializing a candle
+                self.logger.info(f"Initial tick data for {symbol}: {tick}")
+            else:
+                # Update existing candle
+                current_candle = self.current_candle[symbol]
+                
+                # Store values before update for logging
+                prev_high = current_candle['high']
+                prev_low = current_candle['low']
+                prev_close = current_candle['close']
+                
+                # Update high and low
+                high_updated = False
+                low_updated = False
+                
+                if last_price > current_candle['high']:
+                    current_candle['high'] = last_price
+                    high_updated = True
+                
+                if last_price < current_candle['low']:
+                    current_candle['low'] = last_price
+                    low_updated = True
+                
+                # Always update close price and volume
+                current_candle['close'] = last_price
+                if 'volume' in tick:
+                    current_candle['volume'] = tick['volume']
+                
+                # Log candle updates only when values change significantly
+                if high_updated or low_updated or abs(prev_close - last_price) > 0.01:
+                    self.logger.info(f"Updated candle for {symbol}:")
+                    if high_updated:
+                        self.logger.info(f"  High updated: {prev_high} -> {last_price}")
+                    if low_updated:
+                        self.logger.info(f"  Low updated: {prev_low} -> {last_price}")
+                    self.logger.info(f"  Close updated: {prev_close} -> {last_price}")
+                    self.logger.info(f"  Current candle: O={current_candle['open']}, H={current_candle['high']}, L={current_candle['low']}, C={current_candle['close']}")
+                
+                self.current_candle[symbol] = current_candle
+    
+    def check_candle_formation(self, symbol, tick):
+        """
+        Check if we should form a new candle based on time or bar_close flag.
+        
+        Args:
+            symbol: Trading symbol
+            tick: Tick data dictionary
+        """
+        current_time = datetime.now()
+        
+        # Check if tick has bar_close flag
+        if 'bar_close' in tick and tick['bar_close']:
+            self.logger.info(f"Bar close flag detected for {symbol}")
+            self.form_new_candle(symbol, tick)
+            return
+        
+        # If force_candle_closure is enabled, check time-based candle formation
+        if self.force_candle_closure:
+            # Get the timestamp of when the current candle started
+            if symbol in self.current_candle and self.current_candle[symbol]:
+                candle_start_time = self.current_candle[symbol]['timestamp']
+                timeframe_minutes = self.args.timeframe
+                
+                # Check if current time is in a new candle period
+                next_candle_time = candle_start_time + timedelta(minutes=timeframe_minutes)
+                
+                if current_time >= next_candle_time:
+                    self.logger.info(f"Time-based candle closure for {symbol}: {candle_start_time} -> {next_candle_time}")
+                    self.form_new_candle(symbol, tick)
+    
+    def form_new_candle(self, symbol, tick):
+        """
+        Form a new candle and update historical data.
+        
+        Args:
+            symbol: Trading symbol
+            tick: Tick data dictionary
+        """
+        with self.candle_lock:
+            # Skip if there's no current candle
+            if symbol not in self.current_candle or self.current_candle[symbol] is None:
+                return
+            
+            # Get the current candle
+            current_candle = self.current_candle[symbol]
+            
+            self.logger.info(f"Forming new candle for {symbol}: {current_candle}")
+            
+            # Get historical data
+            data = self.strategy.get_historical_data(symbol)
+            if data is None:
+                self.logger.warning(f"No historical data available for {symbol}")
+                return
+            
+            # Create a new row to append
+            new_row = pd.DataFrame([current_candle], index=[current_candle['timestamp']])
+            
+            # Append to historical data
+            updated_data = pd.concat([data, new_row])
+            
+            # Update strategy with new data
+            self.strategy.update_historical_data(symbol, updated_data)
+            
+            # Calculate indicators
+            indicators = self.strategy.calculate_indicators(updated_data)
+            self.strategy.update_indicators(symbol, indicators)
+            
+            # Log the candle formation and indicator values
+            self.logger.info(f"New candle added for {symbol}: {current_candle}")
+            self.log_indicator_values(symbol, indicators)
+            
+            # Mark the current candle as processed
+            self.last_candle_time[symbol] = current_candle['timestamp']
+            
+            # Reset current candle
+            self.current_candle[symbol] = None
+    
+    def log_indicator_values(self, symbol, indicators):
+        """
+        Log indicator values for debugging.
+        
+        Args:
+            symbol: Trading symbol
+            indicators: Indicator dictionary
+        """
+        if not indicators or 'ema_short' not in indicators or 'ema_long' not in indicators:
+            return
+        
+        # Get latest values
+        ema_short = indicators['ema_short'].iloc[-1] if not indicators['ema_short'].empty else None
+        ema_long = indicators['ema_long'].iloc[-1] if not indicators['ema_long'].empty else None
+        
+        if ema_short is not None and ema_long is not None:
+            ema_diff = ema_short - ema_long
+            ema_diff_pct = (ema_diff / ema_long) * 100 if ema_long != 0 else 0
+            
+            self.logger.info(f"{symbol} Indicators (Latest):")
+            self.logger.info(f"  Short EMA: {ema_short:.2f}")
+            self.logger.info(f"  Long EMA: {ema_long:.2f}")
+            self.logger.info(f"  EMA Diff: {ema_diff:.2f} ({ema_diff_pct:.2f}%)")
     
     def execute_order(self, symbol, signal, order_params):
         """
@@ -407,6 +828,7 @@ class EMAStrategyLiveTrader:
                 
         except Exception as e:
             self.logger.error(f"Error executing {action} order for {symbol}: {e}")
+            self.logger.error(traceback.format_exc())
     
     def on_order_update(self, ws, order_data):
         """
@@ -439,6 +861,7 @@ class EMAStrategyLiveTrader:
         
         except Exception as e:
             self.logger.error(f"Error processing order update: {e}")
+            self.logger.error(traceback.format_exc())
     
     def update_positions(self):
         """Update positions in strategy from Zerodha."""
@@ -459,6 +882,7 @@ class EMAStrategyLiveTrader:
         
         except Exception as e:
             self.logger.error(f"Error updating positions: {e}")
+            self.logger.error(traceback.format_exc())
     
     def check_pending_orders(self):
         """Check for orders that have been pending too long and cancel them."""
@@ -491,6 +915,7 @@ class EMAStrategyLiveTrader:
                     
             except Exception as e:
                 self.logger.error(f"Error cancelling order {order_id}: {e}")
+                self.logger.error(traceback.format_exc())
     
     def log_positions_and_pnl(self):
         """Log current positions, P&L, and indicator values for debugging."""
@@ -544,6 +969,22 @@ class EMAStrategyLiveTrader:
                 if data is None or len(data) < 2:
                     self.logger.warning(f"{symbol}: Insufficient historical data for indicator logging")
                     continue
+                
+                # Get latest instrument price
+                current_price = self.last_price.get(symbol)
+                self.logger.info(f"{symbol} Current Price: {current_price}")
+                
+                # Log the latest candle
+                last_candle = data.iloc[-1] if not data.empty else None
+                if last_candle is not None:
+                    self.logger.info(f"{symbol} Last Candle:")
+                    self.logger.info(f"  Timestamp: {data.index[-1]}")
+                    self.logger.info(f"  Open: {last_candle['open']:.2f}")
+                    self.logger.info(f"  High: {last_candle['high']:.2f}")
+                    self.logger.info(f"  Low: {last_candle['low']:.2f}")
+                    self.logger.info(f"  Close: {last_candle['close']:.2f}")
+                    if 'volume' in last_candle:
+                        self.logger.info(f"  Volume: {last_candle['volume']}")
                 
                 # Get indicators
                 indicators = self.strategy.get_indicators(symbol)
@@ -617,10 +1058,22 @@ class EMAStrategyLiveTrader:
             self.logger.info(f"Exit Time: {exit_time} ({'N/A' if time_to_exit is None else f'{time_to_exit:.1f} mins remaining'})")
             self.logger.info(f"Market Close: {market_close} ({'N/A' if time_to_close is None else f'{time_to_close:.1f} mins remaining'})")
             self.logger.info("="*40)
-        
+            
+            # Log WebSocket status
+            self.logger.info("=== WEBSOCKET STATUS ===")
+            self.logger.info(f"Connected: {self.realtime_data.is_connected}")
+            self.logger.info(f"Reconnect Attempts: {self.ws_reconnect_attempts}")
+            
+            # Log tick status
+            self.logger.info("=== TICK STATUS ===")
+            current_time = datetime.now()
+            for symbol in self.symbols:
+                last_tick = self.last_tick_time.get(symbol, datetime.min)
+                seconds_since_last_tick = (current_time - last_tick).total_seconds()
+                self.logger.info(f"{symbol}: Last tick {seconds_since_last_tick:.1f} seconds ago")
+            
         except Exception as e:
             self.logger.error(f"Error logging positions, P&L, and indicators: {e}")
-            import traceback
             self.logger.error(traceback.format_exc())
     
     def shutdown(self):
@@ -637,6 +1090,64 @@ class EMAStrategyLiveTrader:
             
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
+            self.logger.error(traceback.format_exc())
+    
+    def start_candle_timer(self):
+        """Start a background thread to manage candle formation."""
+        if self.candle_timer_thread is not None and self.candle_timer_thread.is_alive():
+            self.logger.info("Candle timer thread already running")
+            return
+        
+        self.logger.info("Starting candle timer thread")
+        self.candle_timer_thread = Thread(target=self._candle_timer_loop)
+        self.candle_timer_thread.daemon = True
+        self.candle_timer_thread.start()
+    
+    def _candle_timer_loop(self):
+        """Background thread function to check and form candles at regular intervals."""
+        self.logger.info("Candle timer thread started")
+        
+        while self.is_running:
+            try:
+                current_time = datetime.now()
+                
+                # Check if it's time to form a new candle for any symbol
+                for symbol in self.symbols:
+                    # Skip if symbol doesn't have a current candle
+                    if symbol not in self.current_candle or self.current_candle[symbol] is None:
+                        continue
+                    
+                    # Get the current candle start time
+                    candle_start_time = self.current_candle[symbol]['timestamp']
+                    timeframe_minutes = self.args.timeframe
+                    
+                    # Calculate when the next candle should start
+                    next_candle_time = candle_start_time + timedelta(minutes=timeframe_minutes)
+                    
+                    # If it's time for a new candle, create one
+                    if current_time >= next_candle_time:
+                        self.logger.info(f"Timer: Time to form new candle for {symbol}: {candle_start_time} -> {next_candle_time}")
+                        
+                        # Get last tick data or use current candle data
+                        last_price = self.last_price.get(symbol)
+                        if last_price:
+                            # Create a minimal tick with the last known price
+                            tick = {
+                                'last_price': last_price,
+                                'bar_close': True
+                            }
+                            
+                            # Form new candle
+                            self.form_new_candle(symbol, tick)
+            
+            except Exception as e:
+                self.logger.error(f"Error in candle timer thread: {e}")
+                self.logger.error(traceback.format_exc())
+            
+            # Sleep for a short time before checking again (1 second)
+            time.sleep(1)
+        
+        self.logger.info("Candle timer thread stopped")
     
     def run(self):
         """Run the live trading strategy."""
@@ -686,8 +1197,12 @@ class EMAStrategyLiveTrader:
             return False
             
         self.logger.info("WebSocket connection started")
-        self.logger.info("Live trading started")
+        
+        # Start the candle timer thread
         self.is_running = True
+        self.start_candle_timer()
+        
+        self.logger.info("Live trading started")
         
         # Log initial positions and indicators
         self.log_positions_and_pnl()
@@ -696,6 +1211,9 @@ class EMAStrategyLiveTrader:
             # Main loop - run until market close
             while self.is_running:
                 current_time = datetime.now()
+                
+                # Check WebSocket connection
+                self.check_websocket_connection()
                 
                 # Log current positions, P&L and indicators at regular intervals
                 if (current_time - self.last_position_log_time).total_seconds() >= self.debug_log_interval:
@@ -719,7 +1237,6 @@ class EMAStrategyLiveTrader:
             self.logger.info("Live trading stopped by user")
         except Exception as e:
             self.logger.error(f"Error in main loop: {e}")
-            import traceback
             self.logger.error(traceback.format_exc())
         finally:
             self.is_running = False
@@ -734,8 +1251,8 @@ def parse_arguments():
     
     # Use config values as defaults if available
     default_symbols = SYMBOLS if config_loaded else "RELIANCE,HDFCBANK"
-    default_short_ema = SHORT_EMA_PERIOD if config_loaded else 9
-    default_long_ema = LONG_EMA_PERIOD if config_loaded else 21
+    default_short_ema = SHORT_EMA_PERIOD if config_loaded else 2
+    default_long_ema = LONG_EMA_PERIOD if config_loaded else 5
     default_timeframe = TIMEFRAME if config_loaded else 5
     default_max_position = MAX_POSITION_SIZE if config_loaded else 1
     
