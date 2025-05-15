@@ -6,7 +6,7 @@ This script runs the strategy in live trading mode, placing actual orders in the
 Use with caution as it will risk real money.
 
 Usage:
-    python run_ema_strategy_live.py --symbols RELIANCE,HDFCBANK --short-ema 9 --long-ema 21 --timeframe 5 --max-position 1
+    python run_ema_strategy_live.py --confirm
 """
 import os
 import sys
@@ -14,8 +14,9 @@ import time
 import logging
 import argparse
 import traceback
+import math
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from threading import Thread, Lock
 
 import pandas as pd
@@ -36,7 +37,8 @@ try:
         SYMBOLS, SHORT_EMA_PERIOD, LONG_EMA_PERIOD, 
         TIMEFRAME, MAX_POSITION_SIZE, STOP_LOSS_PERCENT,
         LOG_LEVEL, LOG_DIR, LOG_TO_FILE, LOG_TO_CONSOLE,
-        MARKET_OPEN_TIME, MARKET_CLOSE_TIME, SQUARE_OFF_TIME
+        MARKET_OPEN_TIME, MARKET_CLOSE_TIME, SQUARE_OFF_TIME,
+        ORDER_UPDATE_INTERVAL, USE_LIMIT_ORDERS
     )
     config_loaded = True
 except ImportError:
@@ -46,6 +48,16 @@ except ImportError:
     LOG_TO_FILE = True
     LOG_TO_CONSOLE = True
     STOP_LOSS_PERCENT = 0.01
+    SYMBOLS = "RELIANCE,HDFCBANK"
+    SHORT_EMA_PERIOD = 2
+    LONG_EMA_PERIOD = 5
+    TIMEFRAME = 5
+    MAX_POSITION_SIZE = 1
+    MARKET_OPEN_TIME = "09:15:00"
+    MARKET_CLOSE_TIME = "15:30:00"
+    SQUARE_OFF_TIME = "15:10:00"
+    ORDER_UPDATE_INTERVAL = 1
+    USE_LIMIT_ORDERS = True
 
 
 class EMAStrategyLiveTrader:
@@ -70,11 +82,26 @@ class EMAStrategyLiveTrader:
         self.order_manager = None
         self.risk_manager = None
         
-        # Trading parameters
-        self.symbols = [s.strip() for s in args.symbols.split(',')]
+        # Trading parameters from config file
+        self.symbols = [s.strip() for s in SYMBOLS.split(',')]
+        self.short_ema_period = SHORT_EMA_PERIOD
+        self.long_ema_period = LONG_EMA_PERIOD
+        self.timeframe = TIMEFRAME
+        self.max_position_size = MAX_POSITION_SIZE
+        self.stop_loss_percent = STOP_LOSS_PERCENT
+        
+        # Parse market timing
+        self.market_open_time = datetime.strptime(MARKET_OPEN_TIME, "%H:%M:%S").time()
+        self.market_close_time = datetime.strptime(MARKET_CLOSE_TIME, "%H:%M:%S").time()
+        self.square_off_time = datetime.strptime(SQUARE_OFF_TIME, "%H:%M:%S").time()
+        
+        # Token mapping
         self.token_map = {}
         self.symbol_token_map = {}
         self.token_symbol_map = {}
+        
+        # Tick size information for proper order pricing
+        self.tick_sizes = {}
         
         # State tracking
         self.is_running = False
@@ -83,19 +110,24 @@ class EMAStrategyLiveTrader:
         self.last_tick_time = {}  # To track when we last received a tick for each symbol
         self.last_price = {}  # To track the last price for each symbol
         self.debug_log_interval = 300  # 5 minutes in seconds
+        self.trade_allowed = {}  # Dictionary to track if trading is allowed for each symbol
         
         # Candle formation
         self.current_candle = {}  # To track the current candle for each symbol
         self.candle_lock = Lock()  # Lock for thread-safe candle updates
         self.candle_timer_thread = None
         self.last_candle_time = {}  # To track when we last formed a candle
-        self.force_candle_closure = True  # Force candle closure even without bar_close flag
+        self.last_trade_candle_time = {}  # To track when we last traded based on a candle
         
         # WebSocket state
         self.connection_check_interval = 60  # Check WebSocket every 60 seconds
         self.last_connection_check = datetime.min
         self.ws_reconnect_attempts = 0
         self.max_ws_reconnect_attempts = 5
+        
+        # Order tracking
+        self.pending_orders = {}  # Symbol -> order_id mapping
+        self.order_status = {}    # order_id -> status mapping
         
         self.logger = logging.getLogger(__name__)
     
@@ -187,33 +219,30 @@ class EMAStrategyLiveTrader:
             self.order_manager = OrderManager(self.kite)
             self.risk_manager = RiskManager(
                 max_risk_per_trade=0.01,  # 1% risk per trade
-                stop_loss_pct=STOP_LOSS_PERCENT if config_loaded else 0.01  # 1% stop loss
+                stop_loss_pct=self.stop_loss_percent
             )
             
             # Format timeframe string
-            timeframe = f"{self.args.timeframe}minute"
+            timeframe_str = f"{self.timeframe}minute"
             
             # Initialize strategy
             self.strategy = EMAIntraDayStrategy(
                 name="EMA_Intraday_Live",
                 universe=self.symbols,
-                timeframe=timeframe,
-                short_ema_period=self.args.short_ema,
-                long_ema_period=self.args.long_ema,
-                max_position_size=self.args.max_position
+                timeframe=timeframe_str,
+                short_ema_period=self.short_ema_period,
+                long_ema_period=self.long_ema_period,
+                max_position_size=self.max_position_size
             )
             
-            # Set custom debug logging interval if specified
-            if hasattr(self.args, 'debug_interval') and self.args.debug_interval > 0:
-                self.debug_log_interval = self.args.debug_interval
-                self.logger.info(f"Setting debug logging interval to {self.debug_log_interval} seconds")
-            
-            # Initialize the candle tracking for each symbol
+            # Initialize the candle and trading tracking for each symbol
             for symbol in self.symbols:
                 self.current_candle[symbol] = None
                 self.last_candle_time[symbol] = datetime.min
+                self.last_trade_candle_time[symbol] = datetime.min
                 self.last_tick_time[symbol] = datetime.min
                 self.last_price[symbol] = None
+                self.trade_allowed[symbol] = False
             
             self.logger.info("Components initialized successfully")
             return True
@@ -231,10 +260,30 @@ class EMAStrategyLiveTrader:
             for symbol in self.symbols:
                 self.strategy.update_position(symbol, {"quantity": 0, "average_price": 0})
             
-            # Get instrument tokens
-            self.logger.info("Fetching instrument tokens for all symbols")
-            self.token_map = self.historical_data_manager.get_instrument_tokens(self.symbols)
-            self.logger.info(f"Retrieved {len(self.token_map)} instrument tokens")
+            # Get instrument tokens and tick sizes
+            self.logger.info("Fetching instrument tokens and tick sizes for all symbols")
+            
+            # Fetch all instruments and find our symbols
+            instruments = self.kite.instruments("NSE")
+            
+            # Create mappings for tokens and tick sizes
+            for symbol in self.symbols:
+                # Find the instrument data for this symbol
+                instrument_data = next((inst for inst in instruments if inst["tradingsymbol"] == symbol), None)
+                
+                if instrument_data:
+                    token = instrument_data["instrument_token"]
+                    tick_size = instrument_data.get("tick_size", 0.05)  # Default to 0.05 if not found
+                    
+                    self.token_map[symbol] = token
+                    self.tick_sizes[symbol] = tick_size
+                    
+                    self.logger.info(f"Found {symbol}: Token={token}, Tick Size={tick_size}")
+                else:
+                    self.logger.warning(f"Could not find instrument data for {symbol}")
+            
+            # Create reverse token mapping
+            self.token_symbol_map = {v: k for k, v in self.token_map.items()}
             
             # Check if we got all tokens
             if len(self.token_map) != len(self.symbols):
@@ -242,11 +291,7 @@ class EMAStrategyLiveTrader:
                 if missing_symbols:
                     self.logger.warning(f"Missing tokens for: {missing_symbols}")
             
-            # Create token mappings
             tokens = list(self.token_map.values())
-            self.symbol_token_map = self.token_map
-            self.token_symbol_map = {v: k for k, v in self.token_map.items()}
-            
             if not tokens:
                 self.logger.error("No valid tokens found for any symbols")
                 return False
@@ -276,21 +321,29 @@ class EMAStrategyLiveTrader:
             self.logger.error(traceback.format_exc())
             return False
     
-    def fetch_historical_data(self, days_back=7):
+    def fetch_historical_data(self):
         """
-        Fetch historical data for initialization.
+        Fetch historical data for initialization based on the long EMA period.
         
-        Args:
-            days_back: Number of days of historical data to fetch
-            
         Returns:
             Dictionary of dataframes with historical data
         """
         historical_data = {}
         
+        # Calculate the number of candles needed based on long EMA period
+        # Adding extra candles to ensure we have enough data
+        min_candles_needed = self.long_ema_period * 3
+        
+        # Calculate how many days to fetch based on timeframe and candles needed
+        # For 5-minute candles, there are 72 candles in a 6-hour trading day
+        candles_per_day = 72  # 6 hours * 12 candles per hour for 5-minute timeframe
+        days_to_fetch = max(3, (min_candles_needed // candles_per_day) + 2)  # Minimum 3 days, add buffer
+        
+        self.logger.info(f"Calculating fetch period: Need {min_candles_needed} candles, fetching {days_to_fetch} days of data")
+        
         # Calculate date range
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=days_back)
+        from_date = to_date - timedelta(days=days_to_fetch)
         
         # Convert to string format required by API
         from_date_str = from_date.strftime('%Y-%m-%d')
@@ -307,7 +360,7 @@ class EMAStrategyLiveTrader:
                     continue
                     
                 # Fetch data - Use the strategy's timeframe
-                interval = self.strategy.timeframe
+                interval = f"{self.timeframe}minute"
                 
                 self.logger.info(f"Fetching historical data for {symbol} with token {token} using interval {interval}")
                 
@@ -316,13 +369,6 @@ class EMAStrategyLiveTrader:
                 )
                 
                 if df is not None and not df.empty:
-                    # Check if data looks valid
-                    has_ohlc_variation = False
-                    for _, row in df.iterrows():
-                        if row['high'] != row['low'] or row['open'] != row['close']:
-                            has_ohlc_variation = True
-                            break
-                    
                     historical_data[symbol] = df
                     self.logger.info(f"Fetched {len(df)} {interval} candles for {symbol}")
                     
@@ -337,8 +383,9 @@ class EMAStrategyLiveTrader:
                         candle = df.iloc[i]
                         self.logger.info(f"  {df.index[i]}: O={candle['open']}, H={candle['high']}, L={candle['low']}, C={candle['close']}, Vol={candle.get('volume', 'N/A')}")
                     
-                    if not has_ohlc_variation:
-                        self.logger.warning(f"WARNING: Historical data for {symbol} shows no variation in OHLC values. This is suspicious and may indicate data quality issues.")
+                    # Verify we have enough data for strategy
+                    if len(df) < min_candles_needed:
+                        self.logger.warning(f"Warning: Got only {len(df)} candles for {symbol}, need at least {min_candles_needed} for reliable signals")
                 else:
                     self.logger.warning(f"No data fetched for {symbol}")
             except Exception as e:
@@ -346,6 +393,49 @@ class EMAStrategyLiveTrader:
                 self.logger.error(traceback.format_exc())
         
         return historical_data
+    
+    def round_to_tick_size(self, symbol, price, is_buy=True):
+        """
+        Round price to the nearest valid tick size.
+        For buy orders, round down to avoid rejection for price too high.
+        For sell orders, round up to avoid rejection for price too low.
+        
+        Args:
+            symbol: Trading symbol
+            price: The price to round
+            is_buy: Whether this is a buy order (True) or sell order (False)
+            
+        Returns:
+            Price rounded to the nearest valid tick size
+        """
+        if symbol not in self.tick_sizes or not self.tick_sizes[symbol]:
+            self.logger.warning(f"No tick size info for {symbol}, using default of 0.05")
+            tick_size = 0.05
+        else:
+            tick_size = self.tick_sizes[symbol]
+        
+        # Calculate how many ticks
+        ticks = price / tick_size
+        
+        if is_buy:
+            # For buy orders, round down to nearest tick
+            rounded_ticks = math.floor(ticks)
+        else:
+            # For sell orders, round up to nearest tick
+            rounded_ticks = math.ceil(ticks)
+        
+        # Calculate rounded price
+        rounded_price = rounded_ticks * tick_size
+        
+        # Ensure we have the right precision (same number of decimal places as tick size)
+        tick_decimals = str(tick_size)[::-1].find('.')
+        if tick_decimals > 0:
+            rounded_price = round(rounded_price, tick_decimals)
+        
+        if price != rounded_price:
+            self.logger.info(f"Rounded price for {symbol} from {price} to {rounded_price} (tick size: {tick_size}, {'buy' if is_buy else 'sell'})")
+        
+        return rounded_price
     
     def setup_callbacks(self):
         """Setup callbacks for the real-time data manager."""
@@ -462,69 +552,18 @@ class EMAStrategyLiveTrader:
             return self.restart_websocket()
         
         # Check if we received ticks recently
-        stale_symbols = self.get_stale_tick_symbols()
-        if stale_symbols:
-            self.logger.warning(f"Tick data is stale for symbols: {stale_symbols}, restarting WebSocket connection...")
-            
-            # Before restarting, log mode and subscription status
-            self.logger.info("Debug WebSocket state before restart:")
-            self.logger.info(f"  is_connected: {self.realtime_data.is_connected}")
-            self.logger.info(f"  subscribed_tokens: {self.realtime_data.subscribed_tokens}")
-            
-            return self.restart_websocket()
-        
-        # Make sure we're getting price variations - log warning if all prices are identical
-        self.check_price_variations()
-        
-        return True
-    
-    def get_stale_tick_symbols(self):
-        """Get list of symbols with stale tick data."""
         stale_symbols = []
-        current_time = datetime.now()
         for symbol in self.symbols:
             last_tick = self.last_tick_time.get(symbol, datetime.min)
             # If we haven't received a tick in 5 minutes for any symbol, consider data stale
             if (current_time - last_tick).total_seconds() > 300:  # 5 minutes
                 stale_symbols.append(symbol)
-        return stale_symbols
-    
-    def check_price_variations(self):
-        """Check if we're getting price variations for each symbol."""
-        current_time = datetime.now()
         
-        # Only check once every 10 minutes
-        if not hasattr(self, 'last_variation_check') or (current_time - self.last_variation_check).total_seconds() > 600:
-            self.last_variation_check = current_time
-            
-            for symbol in self.symbols:
-                # Check current candle
-                if symbol in self.current_candle and self.current_candle[symbol]:
-                    candle = self.current_candle[symbol]
-                    
-                    # If high equals low and open equals close, that's suspicious
-                    if candle['high'] == candle['low'] and candle['open'] == candle['close']:
-                        minutes_old = (current_time - candle['timestamp']).total_seconds() / 60
-                        
-                        # Only warn if the candle has been around for a while (not just started)
-                        if minutes_old >= 2:  # At least 2 minutes old
-                            self.logger.warning(f"WARNING: Current candle for {symbol} has identical OHLC values after {minutes_old:.1f} minutes: {candle}")
-                            self.logger.warning(f"This suggests we may not be receiving price updates correctly for {symbol}")
-                            
-                            # Force a fake price update to see if it's captured
-                            last_price = self.last_price.get(symbol)
-                            if last_price:
-                                # Create a fake tick with a small price change
-                                fake_price = last_price * 1.0001  # 0.01% change
-                                self.logger.info(f"Attempting to verify price update system for {symbol} by injecting a test price: {last_price} -> {fake_price}")
-                                
-                                # Process the fake price update through the normal channels
-                                fake_tick = {
-                                    'last_price': fake_price,
-                                    'volume': candle.get('volume', 0),
-                                    'is_test_tick': True  # Mark as test
-                                }
-                                self.update_current_candle(symbol, fake_tick)
+        if stale_symbols:
+            self.logger.warning(f"Tick data is stale for symbols: {stale_symbols}, restarting WebSocket connection...")
+            return self.restart_websocket()
+        
+        return True
     
     def on_tick(self, symbol, tick):
         """
@@ -548,22 +587,10 @@ class EMAStrategyLiveTrader:
             # Check if price has changed
             prev_price = self.last_price.get(symbol)
             if prev_price is not None and prev_price != last_price:
-                self.logger.info(f"✅ Price change for {symbol}: {prev_price} -> {last_price}")
-            else:
-                self.logger.debug(f"Tick received for {symbol} with price: {last_price} (unchanged)")
+                self.logger.debug(f"Price change for {symbol}: {prev_price} -> {last_price}")
             
             # Update last price
             self.last_price[symbol] = last_price
-            
-        # Log entire tick data periodically (every 20th tick) for debugging
-        if hasattr(self, 'tick_count') and symbol in self.tick_count:
-            self.tick_count[symbol] += 1
-            if self.tick_count[symbol] % 20 == 0:  # Log every 20th tick
-                self.logger.info(f"Full tick data for {symbol}: {tick}")
-        else:
-            if not hasattr(self, 'tick_count'):
-                self.tick_count = {}
-            self.tick_count[symbol] = 1
         
         try:
             # Check if we need to update the current candle
@@ -572,41 +599,90 @@ class EMAStrategyLiveTrader:
             # Check if we should form a new candle
             self.check_candle_formation(symbol, tick)
             
-            # Process tick with strategy
-            signal = self.strategy.process_tick(symbol, tick)
-            
-            # If a signal is generated, process it and place an order
-            if signal:
-                self.logger.info(f"Signal generated for {symbol}: {signal}")
+            # Process tick only if we're allowed to trade
+            if self.should_process_tick(symbol):
+                # Process tick with strategy
+                signal = self.strategy.process_tick(symbol, tick)
                 
-                # Prepare order parameters
-                order_params = self.strategy.prepare_order_parameters(signal, tick)
-                
-                if not order_params:
-                    self.logger.warning(f"Could not prepare order parameters for signal: {signal}")
-                    return
-                
-                # Apply risk management
-                if 'action' not in signal or signal['action'] not in ['UPDATE']:
-                    # Only apply risk management to new orders, not updates
-                    risk_adjusted_params = self.risk_manager.process_signal(signal, tick)
-                    if risk_adjusted_params:
-                        # Merge with original parameters, keeping the strategy's order_type and price
-                        order_params.update({
-                            k: v for k, v in risk_adjusted_params.items() 
-                            if k not in ['order_type', 'price'] and k in order_params
-                        })
-                        self.logger.info(f"Risk-adjusted order parameters: {order_params}")
-                    else:
-                        self.logger.warning(f"Signal rejected by risk manager")
+                # If a signal is generated, process it and place an order
+                if signal:
+                    self.logger.info(f"Signal generated for {symbol}: {signal}")
+                    
+                    # Track that we've traded on this candle
+                    current_candle_time = self.current_candle[symbol]['timestamp'] if self.current_candle.get(symbol) else None
+                    if current_candle_time:
+                        self.last_trade_candle_time[symbol] = current_candle_time
+                    
+                    # Prepare order parameters
+                    order_params = self.strategy.prepare_order_parameters(signal, tick)
+                    
+                    if not order_params:
+                        self.logger.warning(f"Could not prepare order parameters for signal: {signal}")
                         return
-                
-                # Execute the order based on action type
-                self.execute_order(symbol, signal, order_params)
+                    
+                    # Apply risk management
+                    if 'action' not in signal or signal['action'] not in ['UPDATE']:
+                        # Only apply risk management to new orders, not updates
+                        risk_adjusted_params = self.risk_manager.process_signal(signal, tick)
+                        if risk_adjusted_params:
+                            # Merge with original parameters, keeping the strategy's order_type and price
+                            order_params.update({
+                                k: v for k, v in risk_adjusted_params.items() 
+                                if k not in ['order_type', 'price'] and k in order_params
+                            })
+                            self.logger.info(f"Risk-adjusted order parameters: {order_params}")
+                        else:
+                            self.logger.warning(f"Signal rejected by risk manager")
+                            return
+                    
+                    # Execute the order based on action type
+                    self.execute_order(symbol, signal, order_params)
         
         except Exception as e:
             self.logger.error(f"Error processing tick for {symbol}: {e}")
             self.logger.error(traceback.format_exc())
+    
+    def should_process_tick(self, symbol):
+        """
+        Determine if we should process the tick for trading.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            True if we should process the tick, False otherwise
+        """
+        # Check if it's a trading time
+        current_time = datetime.now()
+        current_minute = current_time.minute
+        
+        # Only allow trading at the specified interval
+        # For 5-minute timeframe, this would be at minute 0, 5, 10, 15, etc.
+        is_trading_minute = current_minute % self.timeframe == 0
+        
+        # Check if we've already traded on this candle
+        current_candle_time = self.current_candle.get(symbol, {}).get('timestamp')
+        last_trade_time = self.last_trade_candle_time.get(symbol, datetime.min)
+        
+        # Only allow one trade per candle
+        already_traded_current_candle = (current_candle_time and last_trade_time and 
+                                        current_candle_time == last_trade_time)
+        
+        # Update trade_allowed flag
+        if is_trading_minute and not already_traded_current_candle:
+            if not self.trade_allowed.get(symbol, False):
+                self.logger.info(f"Trading now allowed for {symbol} at {current_time.strftime('%H:%M:%S')}")
+                self.trade_allowed[symbol] = True
+        else:
+            # If trading was previously allowed but now it's not, log it
+            if self.trade_allowed.get(symbol, False):
+                if already_traded_current_candle:
+                    self.logger.info(f"Trading no longer allowed for {symbol} - already traded this candle")
+                else:
+                    self.logger.info(f"Trading no longer allowed for {symbol} - not a trading minute")
+                self.trade_allowed[symbol] = False
+        
+        return self.trade_allowed.get(symbol, False)
     
     def update_current_candle(self, symbol, tick):
         """
@@ -627,7 +703,7 @@ class EMAStrategyLiveTrader:
             if symbol not in self.current_candle or self.current_candle[symbol] is None:
                 # Round down to nearest timeframe interval
                 candle_time = current_time.replace(
-                    minute=(current_time.minute // self.args.timeframe) * self.args.timeframe,
+                    minute=(current_time.minute // self.timeframe) * self.timeframe,
                     second=0,
                     microsecond=0
                 )
@@ -641,44 +717,21 @@ class EMAStrategyLiveTrader:
                     'volume': tick.get('volume', 0)
                 }
                 self.logger.info(f"Initialized new candle for {symbol} at {candle_time}: O={last_price}, H={last_price}, L={last_price}, C={last_price}")
-                
-                # Also log the entire tick data when initializing a candle
-                self.logger.info(f"Initial tick data for {symbol}: {tick}")
             else:
                 # Update existing candle
                 current_candle = self.current_candle[symbol]
                 
-                # Store values before update for logging
-                prev_high = current_candle['high']
-                prev_low = current_candle['low']
-                prev_close = current_candle['close']
-                
                 # Update high and low
-                high_updated = False
-                low_updated = False
-                
                 if last_price > current_candle['high']:
                     current_candle['high'] = last_price
-                    high_updated = True
                 
                 if last_price < current_candle['low']:
                     current_candle['low'] = last_price
-                    low_updated = True
                 
                 # Always update close price and volume
                 current_candle['close'] = last_price
                 if 'volume' in tick:
                     current_candle['volume'] = tick['volume']
-                
-                # Log candle updates only when values change significantly
-                if high_updated or low_updated or abs(prev_close - last_price) > 0.01:
-                    self.logger.info(f"Updated candle for {symbol}:")
-                    if high_updated:
-                        self.logger.info(f"  High updated: {prev_high} -> {last_price}")
-                    if low_updated:
-                        self.logger.info(f"  Low updated: {prev_low} -> {last_price}")
-                    self.logger.info(f"  Close updated: {prev_close} -> {last_price}")
-                    self.logger.info(f"  Current candle: O={current_candle['open']}, H={current_candle['high']}, L={current_candle['low']}, C={current_candle['close']}")
                 
                 self.current_candle[symbol] = current_candle
     
@@ -698,19 +751,18 @@ class EMAStrategyLiveTrader:
             self.form_new_candle(symbol, tick)
             return
         
-        # If force_candle_closure is enabled, check time-based candle formation
-        if self.force_candle_closure:
-            # Get the timestamp of when the current candle started
-            if symbol in self.current_candle and self.current_candle[symbol]:
-                candle_start_time = self.current_candle[symbol]['timestamp']
-                timeframe_minutes = self.args.timeframe
-                
-                # Check if current time is in a new candle period
-                next_candle_time = candle_start_time + timedelta(minutes=timeframe_minutes)
-                
-                if current_time >= next_candle_time:
-                    self.logger.info(f"Time-based candle closure for {symbol}: {candle_start_time} -> {next_candle_time}")
-                    self.form_new_candle(symbol, tick)
+        # Check time-based candle formation
+        # Get the timestamp of when the current candle started
+        if symbol in self.current_candle and self.current_candle[symbol]:
+            candle_start_time = self.current_candle[symbol]['timestamp']
+            timeframe_minutes = self.timeframe
+            
+            # Check if current time is in a new candle period
+            next_candle_time = candle_start_time + timedelta(minutes=timeframe_minutes)
+            
+            if current_time >= next_candle_time:
+                self.logger.info(f"Time-based candle closure for {symbol}: {candle_start_time} -> {next_candle_time}")
+                self.form_new_candle(symbol, tick)
     
     def form_new_candle(self, symbol, tick):
         """
@@ -758,6 +810,9 @@ class EMAStrategyLiveTrader:
             
             # Reset current candle
             self.current_candle[symbol] = None
+            
+            # Reset trade allowed flag to ensure we check again for the new candle
+            self.trade_allowed[symbol] = False
     
     def log_indicator_values(self, symbol, indicators):
         """
@@ -797,15 +852,35 @@ class EMAStrategyLiveTrader:
             
         action = signal.get('action')
         
+        # Check if there's already a pending order for this symbol
+        if symbol in self.pending_orders:
+            pending_order_id = self.pending_orders[symbol]
+            pending_status = self.order_status.get(pending_order_id)
+            
+            # If there's a pending order and it's still open, don't place a new one
+            if pending_status in ['OPEN', 'PENDING', 'TRIGGER PENDING']:
+                self.logger.warning(f"Skipping new order for {symbol} because there's already a pending order: {pending_order_id}")
+                return
+        
         try:
+            # Round price according to tick size if present in order parameters
+            if 'price' in order_params and order_params['price'] is not None:
+                is_buy = action == 'BUY'
+                order_params['price'] = self.round_to_tick_size(symbol, order_params['price'], is_buy)
+            
             if action == 'BUY':
                 self.logger.info(f"Placing BUY order for {symbol} - {order_params.get('quantity')} shares at {order_params.get('price')}")
                 
                 order_id = self.order_manager.place_order(**order_params)
                 self.logger.info(f"Order placed successfully: {order_id}")
                 
+                # Track the pending order
+                self.pending_orders[symbol] = order_id
+                self.order_status[order_id] = 'OPEN'
+                
                 # Register the order with the strategy for tracking
-                self.strategy.register_order(symbol, order_id, 'BUY')
+                if hasattr(self.strategy, 'register_order'):
+                    self.strategy.register_order(symbol, order_id, 'BUY')
                 
             elif action == 'SELL':
                 self.logger.info(f"Placing SELL order for {symbol} - {order_params.get('quantity')} shares at {order_params.get('price')}")
@@ -813,13 +888,29 @@ class EMAStrategyLiveTrader:
                 order_id = self.order_manager.place_order(**order_params)
                 self.logger.info(f"Order placed successfully: {order_id}")
                 
+                # Track the pending order
+                self.pending_orders[symbol] = order_id
+                self.order_status[order_id] = 'OPEN'
+                
                 # Register the order with the strategy for tracking
-                self.strategy.register_order(symbol, order_id, 'SELL')
+                if hasattr(self.strategy, 'register_order'):
+                    self.strategy.register_order(symbol, order_id, 'SELL')
                 
             elif action == 'UPDATE':
                 self.logger.info(f"Updating order for {symbol} - New price: {order_params.get('price')}")
                 
                 order_id = order_params.pop('order_id')  # Remove order_id from parameters
+                
+                # Round the modification price according to tick size
+                if 'price' in order_params and order_params['price'] is not None:
+                    # Get the side from the strategy's active orders
+                    side = 'BUY'  # Default to BUY for safety
+                    if hasattr(self.strategy, 'active_orders') and symbol in self.strategy.active_orders:
+                        side = self.strategy.active_orders[symbol].get('side', 'BUY')
+                    
+                    is_buy = side == 'BUY'
+                    order_params['price'] = self.round_to_tick_size(symbol, order_params['price'], is_buy)
+                    
                 modified_order_id = self.order_manager.modify_order(
                     order_id=order_id,
                     price=order_params.get('price')
@@ -848,8 +939,19 @@ class EMAStrategyLiveTrader:
             
             self.logger.info(f"Order update received: {order_id}, Status: {status}, Symbol: {symbol}")
             
+            # Update order status in our tracking
+            if order_id:
+                self.order_status[order_id] = status
+                
+                # If order completed or cancelled, remove from pending orders
+                if status in ['COMPLETE', 'CANCELLED', 'REJECTED']:
+                    for sym, pending_id in list(self.pending_orders.items()):
+                        if pending_id == order_id:
+                            del self.pending_orders[sym]
+                            self.logger.info(f"Removed {sym} from pending orders: {order_id} status is {status}")
+            
             # Update strategy with order status
-            if symbol and self.strategy:
+            if symbol and hasattr(self.strategy, 'on_order_update'):
                 self.strategy.on_order_update(symbol, order_data)
                 
                 # If order is filled, update position
@@ -887,35 +989,33 @@ class EMAStrategyLiveTrader:
     def check_pending_orders(self):
         """Check for orders that have been pending too long and cancel them."""
         current_time = datetime.now()
-        orders_to_cancel = []
         
-        for symbol, order_info in self.strategy.active_orders.items():
-            # Skip if not in OPEN state
-            if order_info.get('status') != 'OPEN':
-                continue
-                
-            # Check how long the order has been pending
-            order_time = order_info.get('timestamp', current_time - timedelta(minutes=30))
-            order_age = (current_time - order_time).total_seconds()
+        for symbol, order_id in list(self.pending_orders.items()):
+            # Get the current status
+            status = self.order_status.get(order_id)
             
-            # If order has been pending for more than 5 minutes, cancel it
-            if order_age > 300:  # 5 minutes = 300 seconds
-                order_id = order_info.get('order_id')
-                orders_to_cancel.append((symbol, order_id))
-        
-        # Cancel old pending orders
-        for symbol, order_id in orders_to_cancel:
+            # If not in open state, remove from pending
+            if status not in ['OPEN', 'PENDING', 'TRIGGER PENDING']:
+                del self.pending_orders[symbol]
+                continue
+            
+            # Check if order has been pending for more than 5 minutes
+            # Without a timestamp, we'll have to use a crude method to check
             try:
-                self.logger.info(f"Cancelling stale order {order_id} for {symbol}")
-                self.order_manager.cancel_order(order_id=order_id, variety="regular")
-                
-                # Remove from active orders
-                if symbol in self.strategy.active_orders:
-                    del self.strategy.active_orders[symbol]
-                    
+                # Get order history to see when it was placed
+                order_history = self.order_manager.get_order_history(order_id)
+                if order_history:
+                    created_time = order_history[0].get('order_timestamp')
+                    if created_time:
+                        order_age = (current_time - created_time).total_seconds()
+                        
+                        # If order has been pending for more than 5 minutes, cancel it
+                        if order_age > 300:  # 5 minutes = 300 seconds
+                            self.logger.info(f"Cancelling stale order {order_id} for {symbol} (age: {order_age:.1f} seconds)")
+                            self.order_manager.cancel_order(order_id=order_id, variety="regular")
+                            del self.pending_orders[symbol]
             except Exception as e:
-                self.logger.error(f"Error cancelling order {order_id}: {e}")
-                self.logger.error(traceback.format_exc())
+                self.logger.error(f"Error checking order history for {order_id}: {e}")
     
     def log_positions_and_pnl(self):
         """Log current positions, P&L, and indicator values for debugging."""
@@ -941,7 +1041,7 @@ class EMAStrategyLiveTrader:
                 # Get position from day positions
                 position = next((p for p in day_positions if p.get('tradingsymbol') == symbol), None)
                 
-                if position:
+                if position and position.get('quantity', 0) != 0:
                     quantity = position.get('quantity', 0)
                     avg_price = position.get('average_price', 0)
                     last_price = position.get('last_price', 0)
@@ -949,11 +1049,8 @@ class EMAStrategyLiveTrader:
                     
                     position_type = "LONG" if quantity > 0 else "SHORT" if quantity < 0 else "NONE"
                     
-                    if quantity != 0:
-                        self.logger.info(f"{symbol}: {position_type} {abs(quantity)} @ {avg_price:.2f}, Last: {last_price:.2f}, P&L: {pnl:.2f}")
-                        total_pnl += pnl
-                    else:
-                        self.logger.info(f"{symbol}: No position")
+                    self.logger.info(f"{symbol}: {position_type} {abs(quantity)} @ {avg_price:.2f}, Last: {last_price:.2f}, P&L: {pnl:.2f}")
+                    total_pnl += pnl
                 else:
                     self.logger.info(f"{symbol}: No position")
             
@@ -1007,30 +1104,30 @@ class EMAStrategyLiveTrader:
                 # Log the indicator values
                 self.logger.info(f"{symbol} Indicators (Last Candle):")
                 self.logger.info(f"  Close: {last_close:.2f}")
-                self.logger.info(f"  Short EMA ({self.strategy.short_ema_period}): {last_short_ema:.2f}")
-                self.logger.info(f"  Long EMA ({self.strategy.long_ema_period}): {last_long_ema:.2f}")
+                self.logger.info(f"  Short EMA ({self.short_ema_period}): {last_short_ema:.2f}")
+                self.logger.info(f"  Long EMA ({self.long_ema_period}): {last_long_ema:.2f}")
                 self.logger.info(f"  EMA Diff: {ema_diff:.2f} ({ema_diff_pct:.2f}%)")
                 self.logger.info(f"  Signal: {signal_type}")
                 
                 # Check for pending orders
-                has_pending = self.strategy.has_pending_orders(symbol)
+                has_pending = symbol in self.pending_orders
                 self.logger.info(f"  Pending Orders: {'YES' if has_pending else 'NO'}")
                 
-                # Check if symbol is stopped due to stop loss
-                is_stopped = symbol in self.strategy.stopped_symbols
-                self.logger.info(f"  Stopped (Hit Stop Loss): {'YES' if is_stopped else 'NO'}")
+                # Check if trading is allowed
+                is_trading_allowed = self.trade_allowed.get(symbol, False)
+                self.logger.info(f"  Trading Allowed: {'YES' if is_trading_allowed else 'NO'}")
                 
-                # Print entry price and stop loss if position exists
-                entry_price = self.strategy.entry_prices.get(symbol)
-                stop_loss = self.strategy.stop_losses.get(symbol)
+                # Log tick size
+                tick_size = self.tick_sizes.get(symbol, "Unknown")
+                self.logger.info(f"  Tick Size: {tick_size}")
                 
-                if entry_price:
-                    self.logger.info(f"  Entry Price: {entry_price:.2f}")
-                    
-                if stop_loss:
-                    self.logger.info(f"  Stop Loss: {stop_loss:.2f}")
-                    stop_distance_pct = abs((stop_loss - entry_price) / entry_price * 100) if entry_price else 0
-                    self.logger.info(f"  Stop Distance: {stop_distance_pct:.2f}%")
+                # Check if we've already traded on the current candle
+                current_candle_time = self.current_candle.get(symbol, {}).get('timestamp')
+                last_trade_time = self.last_trade_candle_time.get(symbol, datetime.min)
+                traded_current_candle = (current_candle_time and last_trade_time and 
+                                        current_candle_time == last_trade_time)
+                
+                self.logger.info(f"  Traded on Current Candle: {'YES' if traded_current_candle else 'NO'}")
                 
                 # Log crossover proximity
                 if signal_type == "NONE" and abs(ema_diff_pct) < 0.5:
@@ -1040,8 +1137,8 @@ class EMAStrategyLiveTrader:
             
             # Log time until market close and square-off
             current_time = datetime.now().time()
-            market_close = self.strategy.market_close_time
-            exit_time = self.strategy.exit_time
+            market_close = self.market_close_time
+            exit_time = self.square_off_time
             
             time_to_exit = None
             if exit_time > current_time:
@@ -1110,42 +1207,43 @@ class EMAStrategyLiveTrader:
         while self.is_running:
             try:
                 current_time = datetime.now()
+                current_minute = current_time.minute
                 
-                # Check if it's time to form a new candle for any symbol
-                for symbol in self.symbols:
-                    # Skip if symbol doesn't have a current candle
-                    if symbol not in self.current_candle or self.current_candle[symbol] is None:
-                        continue
+                # Check if it's a candle boundary (multiple of timeframe)
+                if current_minute % self.timeframe == 0 and current_time.second == 0:
+                    self.logger.info(f"Timer: Candle boundary detected at {current_time.strftime('%H:%M:%S')}")
                     
-                    # Get the current candle start time
-                    candle_start_time = self.current_candle[symbol]['timestamp']
-                    timeframe_minutes = self.args.timeframe
-                    
-                    # Calculate when the next candle should start
-                    next_candle_time = candle_start_time + timedelta(minutes=timeframe_minutes)
-                    
-                    # If it's time for a new candle, create one
-                    if current_time >= next_candle_time:
-                        self.logger.info(f"Timer: Time to form new candle for {symbol}: {candle_start_time} -> {next_candle_time}")
+                    # Check if any candles need to be formed
+                    for symbol in self.symbols:
+                        # Skip if symbol doesn't have a current candle
+                        if symbol not in self.current_candle or self.current_candle[symbol] is None:
+                            continue
                         
-                        # Get last tick data or use current candle data
-                        last_price = self.last_price.get(symbol)
-                        if last_price:
-                            # Create a minimal tick with the last known price
-                            tick = {
-                                'last_price': last_price,
-                                'bar_close': True
-                            }
+                        # Get the current candle start time
+                        candle_start_time = self.current_candle[symbol]['timestamp']
+                        
+                        # If current candle is from previous interval, form a new one
+                        if candle_start_time.minute != current_minute:
+                            self.logger.info(f"Timer: Forming candle for {symbol} at boundary: {candle_start_time.minute} -> {current_minute}")
                             
-                            # Form new candle
-                            self.form_new_candle(symbol, tick)
+                            # Get last price
+                            last_price = self.last_price.get(symbol)
+                            if last_price:
+                                # Create a minimal tick with the last known price
+                                tick = {
+                                    'last_price': last_price,
+                                    'bar_close': True
+                                }
+                                
+                                # Form new candle
+                                self.form_new_candle(symbol, tick)
             
             except Exception as e:
                 self.logger.error(f"Error in candle timer thread: {e}")
                 self.logger.error(traceback.format_exc())
             
-            # Sleep for a short time before checking again (1 second)
-            time.sleep(1)
+            # Sleep for a short time before checking again (100ms)
+            time.sleep(0.1)
         
         self.logger.info("Candle timer thread stopped")
     
@@ -1159,9 +1257,9 @@ class EMAStrategyLiveTrader:
         print("=" * 80)
         print(f"Strategy: EMA Intraday Crossover")
         print(f"Symbols: {self.symbols}")
-        print(f"Short EMA: {self.args.short_ema}, Long EMA: {self.args.long_ema}")
-        print(f"Timeframe: {self.args.timeframe} minutes")
-        print(f"Max Position Size: {self.args.max_position}")
+        print(f"Short EMA: {self.short_ema_period}, Long EMA: {self.long_ema_period}")
+        print(f"Timeframe: {self.timeframe} minutes")
+        print(f"Max Position Size: {self.max_position_size}")
         print("=" * 80)
         print("\n")
         
@@ -1174,9 +1272,9 @@ class EMAStrategyLiveTrader:
         
         self.logger.info("Starting EMA Intraday Crossover Strategy in LIVE TRADING mode")
         self.logger.info(f"Symbols: {self.symbols}")
-        self.logger.info(f"Short EMA: {self.args.short_ema}, Long EMA: {self.args.long_ema}")
-        self.logger.info(f"Timeframe: {self.args.timeframe} minutes")
-        self.logger.info(f"Max Position Size: {self.args.max_position}")
+        self.logger.info(f"Short EMA: {self.short_ema_period}, Long EMA: {self.long_ema_period}")
+        self.logger.info(f"Timeframe: {self.timeframe} minutes")
+        self.logger.info(f"Max Position Size: {self.max_position_size}")
         
         # Setup and initialize
         if not self.authenticate():
@@ -1211,6 +1309,7 @@ class EMAStrategyLiveTrader:
             # Main loop - run until market close
             while self.is_running:
                 current_time = datetime.now()
+                current_time_of_day = current_time.time()
                 
                 # Check WebSocket connection
                 self.check_websocket_connection()
@@ -1225,13 +1324,55 @@ class EMAStrategyLiveTrader:
                     self.check_pending_orders()
                     self.last_order_check_time = current_time
                 
-                time.sleep(1)  # Sleep to reduce CPU usage
+                time.sleep(0.1)  # Sleep to reduce CPU usage (100ms)
                 
                 # Check if market closed (after 3:30 PM)
-                current_time_of_day = current_time.time()
-                if current_time_of_day >= self.strategy.market_close_time:
+                if current_time_of_day >= self.market_close_time:
                     self.logger.info("Market closed, ending live trading")
                     break
+                
+                # Check if we should square off all positions (usually 15 minutes before market close)
+                if current_time_of_day >= self.square_off_time:
+                    # Get positions
+                    positions = self.order_manager.get_positions()
+                    day_positions = positions.get('day', [])
+                    
+                    # Check if we have any open positions
+                    open_positions = [p for p in day_positions if p.get('quantity', 0) != 0]
+                    
+                    if open_positions:
+                        self.logger.info(f"Square-off time reached ({current_time_of_day}). Closing all positions.")
+                        
+                        # Square off each position
+                        for position in open_positions:
+                            symbol = position.get('tradingsymbol')
+                            quantity = position.get('quantity', 0)
+                            
+                            if quantity != 0:
+                                # Place market order to close position
+                                action = "SELL" if quantity > 0 else "BUY"
+                                
+                                # Prepare order parameters
+                                order_params = {
+                                    "symbol": symbol,
+                                    "exchange": position.get('exchange', 'NSE'),
+                                    "transaction_type": action,
+                                    "quantity": abs(quantity),
+                                    "product": "MIS",
+                                    "order_type": "MARKET",
+                                    "tag": "square_off"
+                                }
+                                
+                                try:
+                                    self.logger.info(f"Square-off: Placing {action} order for {symbol} - {abs(quantity)} shares")
+                                    order_id = self.order_manager.place_order(**order_params)
+                                    self.logger.info(f"Square-off order placed successfully: {order_id}")
+                                except Exception as e:
+                                    self.logger.error(f"Error placing square-off order for {symbol}: {e}")
+                        
+                        # After placing square-off orders, exit the loop
+                        self.logger.info("All square-off orders placed. Exiting.")
+                        break
         
         except KeyboardInterrupt:
             self.logger.info("Live trading stopped by user")
@@ -1249,59 +1390,10 @@ def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Live Trading EMA Intraday Crossover Strategy")
     
-    # Use config values as defaults if available
-    default_symbols = SYMBOLS if config_loaded else "RELIANCE,HDFCBANK"
-    default_short_ema = SHORT_EMA_PERIOD if config_loaded else 2
-    default_long_ema = LONG_EMA_PERIOD if config_loaded else 5
-    default_timeframe = TIMEFRAME if config_loaded else 5
-    default_max_position = MAX_POSITION_SIZE if config_loaded else 1
-    
-    parser.add_argument(
-        "--symbols", 
-        type=str,
-        default=default_symbols,
-        help="Comma-separated list of trading symbols"
-    )
-    
-    parser.add_argument(
-        "--short-ema", 
-        type=int, 
-        default=default_short_ema,
-        help="Short EMA period"
-    )
-    
-    parser.add_argument(
-        "--long-ema", 
-        type=int, 
-        default=default_long_ema,
-        help="Long EMA period"
-    )
-    
-    parser.add_argument(
-        "--timeframe", 
-        type=int, 
-        default=default_timeframe,
-        help="Candle timeframe in minutes"
-    )
-    
-    parser.add_argument(
-        "--max-position", 
-        type=int, 
-        default=default_max_position,
-        help="Maximum position size"
-    )
-    
     parser.add_argument(
         "--confirm", 
         action="store_true",
         help="Confirm live trading without additional prompt"
-    )
-    
-    parser.add_argument(
-        "--debug-interval", 
-        type=int, 
-        default=300,  # 5 minutes
-        help="Interval in seconds for logging debug information"
     )
     
     return parser.parse_args()

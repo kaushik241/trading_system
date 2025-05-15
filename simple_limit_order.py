@@ -54,7 +54,7 @@ import threading
 import math
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-
+load_dotenv(override=True)
 # Import trading system components
 from auth.zerodha_auth import ZerodhaAuth
 from data.realtime_data import RealTimeDataManager
